@@ -1,0 +1,29 @@
+{
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "model": "qwen2.5-coder:1.5b",
+    "timeout": 120,
+    "temperature": 0.3
+  },
+  "agent": {
+    "auto_push": false,
+    "max_commits_per_run": 10,
+    "watch_interval_seconds": 10,
+    "watch_debounce_seconds": 3
+  },
+  "validation": {
+    "enabled": true,
+    "fail_on_error": true,
+    "cmake_build_dir": "build",
+    "python_test_command": "python -m pytest --tb=short -q"
+  },
+  "git": {
+    "default_branch": "main",
+    "sign_commits": false
+  },
+  "logging": {
+    "verbose": false,
+    "log_to_file": false,
+    "log_file": "agent.log"
+  }
+}
