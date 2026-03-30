@@ -482,78 +482,163 @@ class Agent:
         if not ok and not bad:
             self.log.info("No commits created this run.")
 
-        if not successful and not failed:
-            self.log.info("No commits were created this run")
+        recent = git_handler.get_commit_log(path, n=3)
+        if recent:
+            self.log.blank()
+            self.log.info("Recent commit history:")
+            for c in recent:
+                self.log.plain(f"  [{c['hash']}] {c['message']}")
 
         self.log.blank()
 
-    # ─────────────────────────────────────────
-    # Main Entry Point
-    # ─────────────────────────────────────────
+    # ── Extra: Undo Last Commit ──────────────────────────────────
 
-    def run(self, path: str) -> bool:
-        """
-        Execute the full autonomous agent workflow.
+    def undo_last_commit(self, path):
+        path = os.path.abspath(path)
+        self.log.header(f"Undo Last Commit — {path}")
 
-        Steps:
-        0. Preflight checks
-        1. Analyze repo state
-        2. AI analysis + commit planning
-        3. Pre-commit validation
-        4. Execute commits
-        5. Push (if configured)
-        6. Report
+        if not git_handler.is_git_repo(path):
+            self.log.error("Not a Git repository.")
+            return
+        if not git_handler.has_any_commits(path):
+            self.log.error("No commits to undo.")
+            return
 
-        Returns True on success, False on failure.
-        """
+        recent = git_handler.get_commit_log(path, n=1)
+        if recent:
+            self.log.info(f"Will undo: [{recent[0]['hash']}] {recent[0]['message']}")
+
+        if self.interactive:
+            if not self.log.confirm("Undo this commit? (your changes are kept)"):
+                self.log.info("Aborted.")
+                return
+
+        code, out, err = git_handler._run(["git", "reset", "--soft", "HEAD~1"], path)
+        if code == 0:
+            self.log.success("Last commit undone. Changes are back in working tree.")
+        else:
+            self.log.error(f"Undo failed: {err or out}")
+
+    # ── Extra: Create Branch (AI-named) ─────────────────────────
+
+    def create_branch(self, path, branch_name="auto"):
+        path = os.path.abspath(path)
+        self.log.header(f"Create Branch — {path}")
+
+        if not git_handler.is_git_repo(path):
+            self.log.error("Not a Git repository.")
+            return
+
+        if not branch_name or branch_name == "auto":
+            self.log.step("Asking AI to suggest a branch name...")
+            repo_state = git_handler.get_full_repo_state(path)
+            try:
+                branch_name = self.ai.suggest_branch_name(repo_state)
+                self.log.ai("Suggested", branch_name)
+            except Exception:
+                branch_name = "feature/ai-changes"
+
+        branch_name = branch_name.replace(" ", "-").lower()[:50]
+        self.log.info(f"Creating branch: {branch_name}")
+
+        code, _, err = git_handler._run(["git", "checkout", "-b", branch_name], path)
+        if code == 0:
+            self.log.success(f"Switched to new branch: {branch_name}")
+        else:
+            self.log.error(f"Branch creation failed: {err}")
+
+    # ── Extra: Dashboard ─────────────────────────────────────────
+
+    def show_dashboard(self, path):
+        path = os.path.abspath(path)
+        self.log.header(f"Repository Dashboard — {path}")
+
+        if not git_handler.is_git_repo(path):
+            self.log.error("Not a Git repository.")
+            return
+
+        branch  = git_handler.get_current_branch(path)
+        remotes = git_handler.get_remotes(path)
+        status  = git_handler.get_status(path)
+        commits = git_handler.get_commit_log(path, n=5)
+        ptype   = detect_project_type(path)
+
+        self.log.info(f"Branch       : {branch}")
+        self.log.info(f"Project type : {ptype.value}")
+        if remotes:
+            for n, u in remotes.items():
+                self.log.info(f"Remote       : {n} -> {u}")
+        else:
+            self.log.warning("Remote       : none configured")
+
+        self.log.blank()
+        modified = status.get("modified", [])
+        added    = status.get("added",    [])
+        deleted  = status.get("deleted",  [])
+        total    = len(modified) + len(added) + len(deleted)
+
+        if total == 0:
+            self.log.success("Working tree is clean")
+        else:
+            self.log.plain(f"  Changes: {total} file(s)")
+            for f in modified: self.log.plain(f"    [M] {f}")
+            for f in added:    self.log.plain(f"    [A] {f}")
+            for f in deleted:  self.log.plain(f"    [D] {f}")
+
+        if commits:
+            self.log.blank()
+            self.log.plain("  Recent commits:")
+            for c in commits:
+                self.log.plain(f"    [{c['hash']}] {c['message']}")
+        else:
+            self.log.warning("No commits yet in this repository.")
+
+        self.log.blank()
+        available, msg = self.ai.is_available()
+        if available:
+            self.log.success(f"AI Engine    : {msg}")
+        else:
+            self.log.error(f"AI Engine    : {msg}")
+
+        self.log.blank()
+
+    # ── Main Entry Point ─────────────────────────────────────────
+
+    def run(self, path):
         path = os.path.abspath(path)
         self.log.header(f"AI Git Agent — {path}")
 
-        # Phase 0: Preflight
+        if self.dry_run:
+            self.log.warning("DRY RUN MODE — no commits will be made")
+
         if not self._preflight(path):
             return False
 
-        # Phase 1: Analyze
         repo_state = self._analyze_repo(path)
         if repo_state is None:
-            return True  # Nothing to do — not an error
-
-        # Phase 2: AI Planning
-        commit_plans = self._ai_analyze(repo_state)
-        if commit_plans is None:
-            self.log.info("Skipping commit as per AI recommendation.")
             return True
 
-        # Phase 3: Validation
+        plans = self._ai_analyze(repo_state)
+        if plans is None:
+            return True
+
         if not self._validate(path):
-            self.log.error("Aborting: build validation failed.")
+            self.log.error("Aborting: fix build errors above, then re-run.")
             return False
 
-        # Phase 4: Execute
-        results = self._execute_commits(path, commit_plans, repo_state)
+        results = self._execute_commits(path, plans, repo_state)
 
-        # Phase 5: Push
         pushed = False
-        if self.auto_push and any(r.success for r in results):
+        if not self.dry_run and self.auto_push and any(r.success for r in results):
             pushed = self._push(path)
 
-        # Phase 6: Report
-        self._report(results, pushed)
-
+        self._report(results, pushed, path)
         return any(r.success for r in results) or len(results) == 0
 
-    # ─────────────────────────────────────────
-    # Watch Mode Entry Point
-    # ─────────────────────────────────────────
+    # ── Watch Mode ───────────────────────────────────────────────
 
-    def watch(self, path: str):
-        """
-        Start auto-watch mode.
-        Monitors the repo for changes and runs the agent automatically.
-        """
+    def watch(self, path):
         path = os.path.abspath(path)
-
-        # Run once immediately on startup
         self.log.header(f"AI Git Agent — Watch Mode — {path}")
 
         if not self._preflight(path):
@@ -561,7 +646,7 @@ class Agent:
 
         self.log.success("Preflight OK — starting watch loop")
 
-        def on_change(repo_path: str):
+        def on_change(repo_path):
             self.log.blank()
             self.log.step("Change detected — running agent workflow...")
             self.run(repo_path)
