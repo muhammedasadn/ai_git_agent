@@ -240,88 +240,89 @@ class Agent:
                 "Add a .gitignore to exclude them."
             )
 
-        if modified:
-            for f in modified[:5]:
-                self.log.dim(f"  modified: {f}")
-            if len(modified) > 5:
-                self.log.dim(f"  ... and {len(modified) - 5} more")
-
-        if added:
-            for f in added[:5]:
-                self.log.dim(f"  new file: {f}")
-            if len(added) > 5:
-                self.log.dim(f"  ... and {len(added) - 5} more")
-
         return repo_state
 
-    # ─────────────────────────────────────────
-    # Phase 2: AI Analysis
-    # ─────────────────────────────────────────
+    # ── Phase 2: AI Analysis ─────────────────────────────────────
 
-    def _ai_analyze(self, repo_state: dict) -> Optional[list[dict]]:
-        """
-        Ask the AI to:
-        1. Summarize what changed
-        2. Decide if it's worth committing
-        3. Plan logical commit groups
-        """
-        self.log.step("I'm analyzing the diff with AI...")
+    def _ai_analyze(self, repo_state):
+        self.log.step("I'm analyzing the changes with AI...")
 
-        # Ask AI for summary
+        status    = repo_state["status"]
+        modified  = status.get("modified", [])
+        added     = status.get("added",    [])
+        deleted   = status.get("deleted",  [])
+        all_files = modified + added + deleted
+
+        if not all_files:
+            self.log.warning("No files to commit.")
+            return None
+
+        is_first = not repo_state.get("has_commits", True)
+
+        # ── First commit: always commit, just generate a good message ──
+        if is_first:
+            self.log.info("First commit in this repository — generating initial commit...")
+            try:
+                msg = self.ai.generate_initial_commit_message(repo_state)
+            except Exception:
+                msg = "chore: initial project setup"
+            self.log.ai("Message", msg)
+            return [{"message": msg, "files": all_files, "reason": "Initial commit"}]
+
+        # ── AI summary ──
         try:
             summary = self.ai.summarize_changes(repo_state)
-            self.log.ai(f"Summary: {summary}")
+            self.log.ai("Summary", summary)
         except Exception as e:
-            self.log.warning(f"AI summary failed: {e}")
-            summary = "Changes detected"
+            self.log.warning(f"AI summary unavailable: {e}")
 
-        # Ask AI if this is worth committing
-        try:
-            should, reason = self.ai.should_commit(repo_state)
-            if not should:
-                self.log.warning(f"AI recommends skipping commit: {reason}")
+        # ── Smart commit decision (don't skip real files) ──
+        junk_patterns = ["package-lock.json", "yarn.lock", ".DS_Store",
+                         "Thumbs.db", ".pyc", "__pycache__"]
+        real_files = [f for f in all_files
+                      if not any(j in f for j in junk_patterns)]
+
+        if not real_files:
+            # All files look like auto-generated junk
+            self.log.warning("All changes appear to be auto-generated files.")
+            if not self.interactive or not self.log.confirm("Commit anyway?", default=False):
+                self.log.info("Skipping commit.")
                 return None
-            self.log.dim(f"AI commit decision: yes — {reason}")
-        except Exception as e:
-            self.log.dim(f"AI decision check failed ({e}), proceeding anyway")
+        else:
+            self.log.dim(f"  {len(real_files)} real source file(s) — proceeding with commit")
 
-        # Ask AI to plan commits
+        # ── AI commit planning ──
         self.log.step("I'm splitting changes into logical commits...")
         try:
-            commit_plans = self.ai.plan_commits(repo_state)
+            plans = self.ai.plan_commits(repo_state)
         except Exception as e:
-            self.log.warning(f"AI commit planning failed: {e}")
-            # Fallback: one commit with all files
-            status = repo_state["status"]
-            all_files = (
-                status.get("modified", []) +
-                status.get("added", []) +
-                status.get("deleted", [])
-            )
-            commit_plans = [{
-                "message": "chore: update files",
-                "files": all_files,
-                "reason": "Fallback: all files in one commit"
-            }]
+            self.log.warning(f"AI planning failed ({e}) — using single commit")
+            try:
+                msg = self.ai.generate_commit_message(repo_state)
+            except Exception:
+                msg = "chore: update project files"
+            plans = [{"message": msg, "files": all_files, "reason": "Fallback single commit"}]
 
-        n = len(commit_plans)
-        self.log.success(f"I'm splitting changes into {n} commit{'s' if n > 1 else ''}...")
+        self.log.success(f"AI planned {len(plans)} commit(s)")
+        for i, p in enumerate(plans, 1):
+            self.log.plain(f"  {i}. {p['message']}")
+            if p.get("reason"):
+                self.log.dim(f"     Reason : {p['reason']}")
+            for f in p.get("files", [])[:3]:
+                self.log.dim(f"     File   : {f}")
+            extra = len(p.get("files", [])) - 3
+            if extra > 0:
+                self.log.dim(f"     ... and {extra} more")
 
-        for i, plan in enumerate(commit_plans, 1):
-            self.log.info(f"  Commit {i}: {plan['message']}")
-            if plan.get("reason"):
-                self.log.dim(f"    Reason: {plan['reason']}")
-            for f in plan.get("files", [])[:3]:
-                self.log.dim(f"    {f}")
-            if len(plan.get("files", [])) > 3:
-                self.log.dim(f"    ... and {len(plan['files']) - 3} more files")
+        if len(plans) > self.max_commits:
+            self.log.warning(f"Capping at {self.max_commits} commits")
+            plans = plans[:self.max_commits]
 
-        # Cap at max commits
-        if len(commit_plans) > self.max_commits:
-            self.log.warning(
-                f"Capping at {self.max_commits} commits (max_commits_per_run setting)"
-            )
-            commit_plans = commit_plans[:self.max_commits]
+        if self.interactive:
+            self.log.blank()
+            if not self.log.confirm(f"Proceed with {len(plans)} commit(s)?"):
+                self.log.info("Aborted by user.")
+                return None
 
         return commit_plans
 
