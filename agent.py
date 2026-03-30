@@ -324,181 +324,163 @@ class Agent:
                 self.log.info("Aborted by user.")
                 return None
 
-        return commit_plans
+        return plans
 
-    # ─────────────────────────────────────────
-    # Phase 3: Pre-Commit Validation
-    # ─────────────────────────────────────────
+    # ── Phase 3: Validation ──────────────────────────────────────
 
-    def _validate(self, path: str) -> bool:
-        """
-        Run build/test validation before committing.
-        Returns True if validation passed (or was skipped).
-        """
+    def _validate(self, path):
         self.log.step("Running build/test validation...")
-
         project_type = self.validator.detect(path)
-        self.log.info(f"Project type detected: {project_type.value}")
+        self.log.info(f"Project type : {project_type.value}")
 
         result = self.validator.run(path, project_type)
 
         if result.skipped:
-            self.log.warning(f"Validation skipped: {result.summary()}")
+            self.log.info(f"Validation skipped (no validator for {project_type.value})")
             return True
 
         if result.passed:
-            self.log.success(f"Build passed ✓")
+            self.log.success("Build/tests passed")
             return True
-        else:
-            self.log.error(f"Build/tests FAILED — stopping before commit")
-            self.log.blank()
 
-            # Show the error output
-            error_lines = (result.error or result.output).strip().splitlines()
-            for line in error_lines[-15:]:
-                print(f"    {line}")
+        self.log.error("Build/tests FAILED — stopping before commit")
+        self.log.blank()
+        err_text = (result.error or result.output).strip()
+        for line in err_text.splitlines()[-15:]:
+            self.log.plain(f"  | {line}")
 
-            # Ask AI to explain the error
-            self.log.blank()
-            self.log.step("Asking AI to explain the error...")
-            try:
-                explanation = self.ai.analyze_error(
-                    result.error or result.output,
-                    project_type.value
-                )
-                self.log.ai(explanation)
-            except Exception as e:
-                self.log.dim(f"AI explanation unavailable: {e}")
+        self.log.blank()
+        self.log.step("Asking AI to explain the error...")
+        try:
+            explanation = self.ai.analyze_error(err_text, project_type.value)
+            self.log.ai("Explanation", explanation)
+        except Exception:
+            pass
 
-            return False
+        if self.interactive:
+            if self.log.confirm("Commit anyway (dangerous)?", default=False):
+                self.log.warning("Proceeding despite failure (user override)")
+                return True
 
-    # ─────────────────────────────────────────
-    # Phase 4: Execute Commits
-    # ─────────────────────────────────────────
+        return False
 
-    def _execute_commits(self, path: str, commit_plans: list[dict], repo_state: dict) -> list[CommitResult]:
-        """
-        Execute each planned commit:
-        1. Stage the specified files
-        2. Create the commit
-        3. Record the result
-        """
+    # ── Phase 4: Execute Commits ─────────────────────────────────
+
+    def _execute_commits(self, path, plans, repo_state):
+        if self.dry_run:
+            self.log.step("[DRY RUN] Would create these commits:")
+            for i, p in enumerate(plans, 1):
+                self.log.plain(f"  {i}. {p['message']}")
+                for f in p.get("files", []):
+                    self.log.dim(f"     {f}")
+            self.log.info("Dry run complete — no changes made.")
+            return []
+
         self.log.step("Creating commits...")
         results = []
-
-        # Get all changed files for reference
-        status = repo_state["status"]
+        status  = repo_state["status"]
         all_changed = set(
             status.get("modified", []) +
-            status.get("added", []) +
-            status.get("deleted", [])
+            status.get("added",    []) +
+            status.get("deleted",  [])
         )
+        done = set()
 
-        for i, plan in enumerate(commit_plans, 1):
-            message = plan["message"]
-            planned_files = plan.get("files", [])
+        for i, plan in enumerate(plans, 1):
+            message  = plan["message"]
+            planned  = plan.get("files", [])
+            is_last  = (i == len(plans))
 
-            self.log.info(f"Creating commit {i}/{len(commit_plans)}: {message}")
+            self.log.info(f"Commit {i}/{len(plans)}: {message}")
 
-            # Filter to only files that actually exist in the changeset
-            files_to_stage = [f for f in planned_files if f in all_changed]
+            to_stage = [f for f in planned if f in all_changed and f not in done]
 
-            # If no files match exactly, use all remaining changed files
-            if not files_to_stage and i == len(commit_plans):
-                # Last commit: catch any remaining files
-                already_planned = set()
-                for prev_plan in commit_plans[:i-1]:
-                    already_planned.update(prev_plan.get("files", []))
-                files_to_stage = list(all_changed - already_planned)
+            # Last commit catches any stragglers
+            if is_last:
+                remaining = all_changed - done
+                for f in remaining:
+                    if f not in to_stage:
+                        to_stage.append(f)
 
-            if not files_to_stage:
-                self.log.warning(f"  No matching files found for this commit, skipping")
+            if not to_stage:
+                self.log.warning("  No files for this commit — skipping")
                 continue
 
-            # Stage the files
-            ok, err = git_handler.stage_files(path, files_to_stage)
+            for f in to_stage:
+                self.log.dim(f"  staging: {f}")
+
+            ok, err = git_handler.stage_files(path, to_stage)
             if not ok:
-                # Try staging all if selective staging fails
-                self.log.dim(f"  Selective staging failed ({err}), trying git add -A")
+                self.log.dim(f"  Selective stage failed ({err}), using git add -A")
                 ok, err = git_handler.stage_all(path)
                 if not ok:
-                    self.log.error(f"  Failed to stage files: {err}")
-                    results.append(CommitResult(
-                        message=message, files=files_to_stage,
-                        success=False, error=err
-                    ))
+                    self.log.error(f"  Stage failed: {err}")
+                    results.append(CommitResult(message=message, files=to_stage,
+                                                success=False, error=err))
                     continue
 
-            # Create the commit
             success, hash_, err = git_handler.commit(path, message)
 
             if success:
-                self.log.commit(hash_, message)
-                results.append(CommitResult(
-                    message=message, files=files_to_stage,
-                    hash_=hash_, success=True
-                ))
+                self.log.commit_line(hash_, message)
+                results.append(CommitResult(message=message, files=to_stage,
+                                            hash_=hash_, success=True))
+                done.update(to_stage)
             elif err == "nothing_to_commit":
-                self.log.warning(f"  Nothing staged for this commit (skipping)")
+                self.log.warning("  Nothing staged — skipping")
             else:
                 self.log.error(f"  Commit failed: {err}")
-                results.append(CommitResult(
-                    message=message, files=files_to_stage,
-                    success=False, error=err
-                ))
+                results.append(CommitResult(message=message, files=to_stage,
+                                            success=False, error=err))
 
         return results
 
-    # ─────────────────────────────────────────
-    # Phase 5: Push
-    # ─────────────────────────────────────────
+    # ── Phase 5: Push ────────────────────────────────────────────
 
-    def _push(self, path: str) -> bool:
-        """Push all commits to the remote."""
+    def _push(self, path):
         remotes = git_handler.get_remotes(path)
         if not remotes:
             self.log.warning("No remote configured — skipping push")
             return False
 
-        remote_name = list(remotes.keys())[0]
+        remote = list(remotes.keys())[0]
         branch = git_handler.get_current_branch(path)
+        self.log.step(f"Pushing to '{remote}' ({branch})...")
 
-        self.log.step(f"Pushing to remote '{remote_name}' ({branch})...")
-        success, err = git_handler.push(path, remote_name, branch)
-
+        success, err = git_handler.push(path, remote, branch)
         if success:
-            self.log.success(f"Pushed to {remote_name}/{branch}")
+            self.log.success(f"Pushed to {remote}/{branch}")
             return True
         else:
             self.log.error(f"Push failed: {err}")
-            self.log.info("You can push manually with: git push")
+            self.log.info("Push manually: git push")
             return False
 
-    # ─────────────────────────────────────────
-    # Phase 6: Final Report
-    # ─────────────────────────────────────────
+    # ── Phase 6: Report ──────────────────────────────────────────
 
-    def _report(self, results: list[CommitResult], pushed: bool):
-        """Print a final summary of everything that happened."""
+    def _report(self, results, pushed, path):
         self.log.header("Agent Run Complete")
 
-        successful = [r for r in results if r.success]
-        failed = [r for r in results if not r.success]
+        ok  = [r for r in results if r.success]
+        bad = [r for r in results if not r.success]
 
-        if successful:
-            self.log.success(f"{len(successful)} commit(s) created:")
-            for r in successful:
-                self.log.commit(r.hash, r.message)
+        if ok:
+            self.log.success(f"{len(ok)} commit(s) created:")
+            for r in ok:
+                self.log.commit_line(r.hash, r.message)
 
-        if failed:
-            self.log.error(f"{len(failed)} commit(s) failed:")
-            for r in failed:
-                self.log.error(f"  '{r.message}' — {r.error}")
+        if bad:
+            self.log.error(f"{len(bad)} commit(s) failed:")
+            for r in bad:
+                self.log.error(f"  '{r.message}' -> {r.error}")
 
         if pushed:
             self.log.success("All commits pushed to remote")
-        elif successful:
-            self.log.info("Commits are local only (push was skipped or failed)")
+        elif ok:
+            self.log.info("Commits are local. Push manually: git push")
+
+        if not ok and not bad:
+            self.log.info("No commits created this run.")
 
         if not successful and not failed:
             self.log.info("No commits were created this run")
