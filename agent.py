@@ -159,80 +159,86 @@ class Agent:
         self.log       = Logger(verbose=self.verbose, use_unicode=self.unicode)
         self.ai        = AIEngine(config)
         self.validator = Validator(config)
-        self.watcher = Watcher(config)
+        self.watcher   = Watcher(config)
 
-    # ─────────────────────────────────────────
-    # Phase 0: Preflight Checks
-    # ─────────────────────────────────────────
+    # ── Phase 0: Preflight + Auto-Init ──────────────────────────
 
-    def _preflight(self, path: str) -> bool:
-        """
-        Check all prerequisites before starting the workflow.
-        Returns True if everything is OK, False if we should abort.
-        """
-        # Check 1: Is this a Git repo?
+    def _preflight(self, path):
         self.log.step("Running preflight checks...")
 
         if not git_handler.is_git_repo(path):
-            self.log.error(f"'{path}' is not a Git repository.")
-            self.log.info("Run: git init")
-            return False
-        self.log.success("Git repository confirmed")
+            if self.auto_init:
+                self.log.warning(f"'{path}' is not a Git repository.")
+                self.log.init_action("Auto-initializing Git repository...")
+                ok, msg = git_handler.init_repo(path)
+                if ok:
+                    self.log.success("Git repository initialized")
+                    self.log.dim(msg)
+                else:
+                    self.log.error(f"git init failed: {msg}")
+                    return False
+            else:
+                self.log.error(f"Not a Git repository: {path}")
+                self.log.info("Fix: run `git init` in your project folder")
+                return False
+        else:
+            self.log.success("Git repository confirmed")
 
-        # Check 2: Is Ollama running with the right model?
         self.log.info("Checking Ollama / AI engine...")
         available, msg = self.ai.is_available()
         if not available:
-            self.log.error(f"AI engine not available: {msg}")
+            self.log.error(f"AI engine unavailable: {msg}")
             return False
         self.log.success(msg)
-
         return True
 
-    # ─────────────────────────────────────────
-    # Phase 1: Repository Analysis
-    # ─────────────────────────────────────────
+    # ── Phase 1: Repo Analysis ───────────────────────────────────
 
-    def _analyze_repo(self, path: str) -> Optional[dict]:
-        """
-        Collect and display the current state of the repository.
-        Returns repo_state dict or None if nothing to do.
-        """
+    def _analyze_repo(self, path):
         self.log.step("I'm checking the repo state...")
 
         repo_state = git_handler.get_full_repo_state(path)
-        status = repo_state["status"]
+        status     = repo_state["status"]
 
         if status.get("error"):
             self.log.error(f"Git error: {status['error']}")
             return None
 
-        branch = repo_state["branch"]
-        remotes = repo_state["remotes"]
+        branch   = repo_state["branch"]
+        remotes  = repo_state["remotes"]
         modified = status.get("modified", [])
-        added = status.get("added", [])
-        deleted = status.get("deleted", [])
+        added    = status.get("added",    [])
+        deleted  = status.get("deleted",  [])
+        total    = len(modified) + len(added) + len(deleted)
 
-        self.log.info(f"Branch: {branch}")
-
+        self.log.info(f"Branch : {branch}")
         if remotes:
             for name, url in remotes.items():
-                self.log.info(f"Remote: {name} → {url}")
+                self.log.info(f"Remote : {name} -> {url}")
         else:
-            self.log.warning("No remotes configured (push will be skipped)")
-
-        # Summarize findings
-        total = len(modified) + len(added) + len(deleted)
+            self.log.warning("No remote configured (push will be skipped)")
 
         if total == 0 and not status.get("staged"):
-            self.log.warning("No changes detected in the working tree.")
-            self.log.info("Nothing to commit.")
+            self.log.warning("Working tree is clean — nothing to commit.")
             return None
 
         self.log.success(
-            f"I found {total} changed file(s): "
+            f"I found {total} change(s): "
             f"{len(modified)} modified, {len(added)} new, {len(deleted)} deleted"
         )
+        for f in modified[:5]: self.log.dim(f"  modified : {f}")
+        for f in added[:5]:    self.log.dim(f"  new file : {f}")
+        for f in deleted[:3]:  self.log.dim(f"  deleted  : {f}")
+        if total > 5:
+            self.log.dim(f"  ... and {total - 5} more")
+
+        # Warn about node_modules being untracked
+        huge = [f for f in added if "node_modules" in f or ".next/" in f]
+        if huge:
+            self.log.warning(
+                f"{len(huge)} auto-generated file(s) detected (node_modules etc). "
+                "Add a .gitignore to exclude them."
+            )
 
         if modified:
             for f in modified[:5]:
