@@ -3,20 +3,21 @@ agent.py
 ========
 The brain of the ai-git-agent — the decision-making orchestrator.
 
-This module:
-1. Collects repo state (via git_handler)
-2. Asks the AI to analyze and plan (via ai_engine)
-3. Validates the code (via validator)
-4. Executes the plan (via git_handler)
-5. Reports results clearly
-
-Think of this as the "senior engineer" who delegates to specialists
-but makes all the final decisions.
+FIXES & NEW FEATURES vs v1:
+  - Auto git init if repo not initialized
+  - AI no longer skips valid new project files
+  - Untracked file content sent to AI for better analysis
+  - Interactive mode: asks user before committing
+  - Dry-run mode: plan without executing
+  - Undo last commit feature
+  - Branch creation + AI branch naming
+  - Dashboard: rich status view
+  - ASCII-safe logging (no broken unicode symbols)
+  - Better "first commit" detection
 """
 
 import os
 import sys
-import time
 from typing import Optional
 
 import git_handler
@@ -26,135 +27,137 @@ from watcher import Watcher
 
 
 # ─────────────────────────────────────────────
-# Console Output (developer-like logging)
+# Console Logger
 # ─────────────────────────────────────────────
 
 class Logger:
-    """
-    Provides structured, color-coded terminal logging.
-    The log style mimics how a real developer communicates about their work.
-    """
-
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-
-    # Colors
-    CYAN = "\033[96m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    BLUE = "\033[94m"
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    CYAN    = "\033[96m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    RED     = "\033[91m"
+    BLUE    = "\033[94m"
     MAGENTA = "\033[95m"
-    WHITE = "\033[97m"
+    WHITE   = "\033[97m"
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose=False, use_unicode=False):
         self.verbose = verbose
-        self._indent = 0
+        if use_unicode:
+            self.SYM_STEP   = "●"
+            self.SYM_OK     = "✓"
+            self.SYM_WARN   = "⚠"
+            self.SYM_ERR    = "✗"
+            self.SYM_ARROW  = "→"
+            self.SYM_COMMIT = "◆"
+            self.SYM_AI     = "[AI]"
+            self.SYM_DIV    = "─"
+            self.SYM_INIT   = "★"
+        else:
+            self.SYM_STEP   = ">>"
+            self.SYM_OK     = "[OK]"
+            self.SYM_WARN   = "[!!]"
+            self.SYM_ERR    = "[XX]"
+            self.SYM_ARROW  = "  ->"
+            self.SYM_COMMIT = "[*]"
+            self.SYM_AI     = "[AI]"
+            self.SYM_DIV    = "-"
+            self.SYM_INIT   = "[GIT]"
 
-    def _supports_color(self) -> bool:
+    def _tty(self):
         return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
-    def _color(self, text: str, color: str) -> str:
-        if self._supports_color():
-            return f"{color}{text}{self.RESET}"
-        return text
+    def _c(self, text, color):
+        return f"{color}{text}{self.RESET}" if self._tty() else text
 
-    def step(self, message: str):
-        """Main agent step — printed prominently."""
-        prefix = self._color("●", self.CYAN)
-        print(f"\n{prefix} {self._color(message, self.BOLD + self.WHITE)}")
+    def step(self, msg):
+        sym = self._c(self.SYM_STEP, self.CYAN)
+        print(f"\n{sym} {self._c(msg, self.BOLD + self.WHITE)}")
 
-    def info(self, message: str):
-        """General information."""
-        prefix = self._color("  →", self.BLUE)
-        print(f"{prefix} {message}")
+    def info(self, msg):
+        sym = self._c(self.SYM_ARROW, self.BLUE)
+        print(f"{sym} {msg}")
 
-    def success(self, message: str):
-        """Successful operation."""
-        prefix = self._color("  ✓", self.GREEN)
-        print(f"{prefix} {self._color(message, self.GREEN)}")
+    def success(self, msg):
+        sym = self._c(self.SYM_OK, self.GREEN)
+        print(f"  {sym} {self._c(msg, self.GREEN)}")
 
-    def warning(self, message: str):
-        """Warning — non-fatal."""
-        prefix = self._color("  ⚠", self.YELLOW)
-        print(f"{prefix} {self._color(message, self.YELLOW)}")
+    def warning(self, msg):
+        sym = self._c(self.SYM_WARN, self.YELLOW)
+        print(f"  {sym} {self._c(msg, self.YELLOW)}")
 
-    def error(self, message: str):
-        """Error — may be fatal."""
-        prefix = self._color("  ✗", self.RED)
-        print(f"{prefix} {self._color(message, self.RED)}")
+    def error(self, msg):
+        sym = self._c(self.SYM_ERR, self.RED)
+        print(f"  {sym} {self._c(msg, self.RED)}")
 
-    def ai(self, message: str):
-        """AI-generated output."""
-        prefix = self._color("  🤖", self.MAGENTA)
-        print(f"{prefix} {self._color(message, self.MAGENTA)}")
+    def ai(self, label, msg):
+        sym = self._c(self.SYM_AI, self.MAGENTA)
+        print(f"  {sym} {self._c(label + ':', self.MAGENTA)} {msg}")
 
-    def commit(self, hash_: str, message: str):
-        """Commit created."""
-        hash_str = self._color(f"[{hash_}]", self.YELLOW)
-        msg_str = self._color(message, self.WHITE)
-        print(f"  {self._color('✓', self.GREEN)} {hash_str} {msg_str}")
+    def commit_line(self, hash_, msg):
+        sym = self._c(self.SYM_COMMIT, self.YELLOW)
+        h   = self._c(f"[{hash_}]", self.YELLOW)
+        m   = self._c(msg, self.WHITE)
+        print(f"  {sym} {h} {m}")
+
+    def init_action(self, msg):
+        sym = self._c(self.SYM_INIT, self.CYAN)
+        print(f"  {sym} {self._c(msg, self.CYAN)}")
 
     def divider(self):
-        """Visual separator."""
-        line = self._color("─" * 60, self.DIM)
+        line = self._c(self.SYM_DIV * 60, self.DIM)
         print(f"\n{line}")
 
-    def header(self, title: str):
-        """Section header."""
+    def header(self, title):
         self.divider()
-        print(f"  {self._color(title.upper(), self.BOLD + self.CYAN)}")
+        print(f"  {self._c(title.upper(), self.BOLD + self.CYAN)}")
         self.divider()
 
-    def dim(self, message: str):
-        """Subdued text for verbose-only info."""
+    def dim(self, msg):
         if self.verbose:
-            print(f"  {self._color(message, self.DIM)}")
+            print(f"     {self._c(msg, self.DIM)}")
+
+    def plain(self, msg):
+        print(f"  {msg}")
 
     def blank(self):
         print()
 
+    def confirm(self, question, default=True):
+        hint = "[Y/n]" if default else "[y/N]"
+        sym = self._c("  ?", self.CYAN)
+        try:
+            answer = input(f"{sym} {question} {hint}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return default
+        if not answer:
+            return default
+        return answer in ("y", "yes")
 
-# ─────────────────────────────────────────────
-# Commit Result
-# ─────────────────────────────────────────────
 
 class CommitResult:
-    """Stores the result of a single commit operation."""
-
-    def __init__(self, message: str, files: list[str], hash_: str = "",
-                 success: bool = True, error: str = ""):
+    def __init__(self, message, files, hash_="", success=True, error=""):
         self.message = message
-        self.files = files
-        self.hash = hash_
+        self.files   = files
+        self.hash    = hash_
         self.success = success
-        self.error = error
+        self.error   = error
 
-
-# ─────────────────────────────────────────────
-# Agent Class
-# ─────────────────────────────────────────────
 
 class Agent:
-    """
-    The main autonomous Git agent.
+    def __init__(self, config):
+        self.config      = config
+        self.verbose     = config.get("logging", {}).get("verbose", False)
+        self.auto_push   = config.get("agent",   {}).get("auto_push", False)
+        self.max_commits = config.get("agent",   {}).get("max_commits_per_run", 10)
+        self.auto_init   = config.get("agent",   {}).get("auto_init", True)
+        self.interactive = config.get("agent",   {}).get("interactive", False)
+        self.dry_run     = config.get("agent",   {}).get("dry_run", False)
+        self.unicode     = config.get("logging", {}).get("unicode_symbols", False)
 
-    It combines AI reasoning with Git operations to:
-    - Understand what changed
-    - Plan logical commits
-    - Validate before committing
-    - Execute and report
-    """
-
-    def __init__(self, config: dict):
-        self.config = config
-        self.verbose = config.get("logging", {}).get("verbose", False)
-        self.auto_push = config.get("agent", {}).get("auto_push", False)
-        self.max_commits = config.get("agent", {}).get("max_commits_per_run", 10)
-
-        self.log = Logger(verbose=self.verbose)
-        self.ai = AIEngine(config)
+        self.log       = Logger(verbose=self.verbose, use_unicode=self.unicode)
+        self.ai        = AIEngine(config)
         self.validator = Validator(config)
         self.watcher = Watcher(config)
 
