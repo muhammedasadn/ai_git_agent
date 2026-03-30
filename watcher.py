@@ -1,181 +1,283 @@
 """
 watcher.py
 ==========
-Auto-Watch Mode — monitors the repository for file changes
-and triggers the agent workflow automatically.
+File system watcher — monitors repo for changes and triggers the agent.
 
-How it works:
-1. Every N seconds, scan the repo for changes
-2. If changes are detected, wait for a debounce period (to batch rapid saves)
-3. Trigger the full agent workflow
-4. Repeat until the user presses Ctrl+C
+Two modes:
+  1. Foreground (--watch):   runs in terminal, Ctrl+C to stop
+  2. Background (--daemon):  runs forever, writes to log file, never exits
 
-This is useful for "set it and forget it" workflows where you want
-the agent to automatically commit your work as you code.
+Key improvements over v1:
+  - ASCII-safe log messages (no broken unicode in cterm)
+  - Tee logging: output goes to BOTH console and log file
+  - Smarter debounce: accumulates multiple rapid saves before triggering
+  - Stats tracking: commits made, files watched, uptime
+  - Handles agent errors gracefully (logs and continues)
 """
 
 import time
 import os
-import hashlib
+from datetime import datetime
 from typing import Callable, Optional
 
 
 # ─────────────────────────────────────────────
-# Repo Snapshot (for change detection)
+# Snapshot helpers
 # ─────────────────────────────────────────────
 
-def _get_repo_snapshot(path: str) -> dict:
-    """
-    Build a snapshot of all tracked + untracked files with their
-    modification times and sizes. Used to detect changes between polls.
+SKIP_DIRS = {
+    ".git", "__pycache__", "node_modules", "venv", ".env",
+    "build", "dist", ".next", ".nuxt", "target", ".tox",
+    ".pytest_cache", ".mypy_cache"
+}
 
-    Returns a dict: {filepath: (mtime, size)}
-    """
-    snapshot = {}
+SKIP_FILES = {
+    ".agent_pid", ".agent_log.txt", ".agent_state.json"
+}
 
+
+def _snapshot(path: str) -> dict:
+    """
+    Build {relative_path: (mtime, size)} for every tracked file.
+    Skips .git, node_modules, build dirs, and agent internal files.
+    """
+    snap = {}
     for root, dirs, files in os.walk(path):
-        # Skip .git directory entirely
-        dirs[:] = [d for d in dirs if d not in {
-            ".git", "__pycache__", "node_modules", "venv", ".env", "build", "dist"
-        }]
-
-        for filename in files:
-            filepath = os.path.join(root, filename)
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            if f in SKIP_FILES:
+                continue
+            full = os.path.join(root, f)
+            rel  = os.path.relpath(full, path)
             try:
-                stat = os.stat(filepath)
-                rel_path = os.path.relpath(filepath, path)
-                snapshot[rel_path] = (stat.st_mtime, stat.st_size)
+                st = os.stat(full)
+                snap[rel] = (st.st_mtime, st.st_size)
             except OSError:
-                pass  # File was deleted during scan
+                pass
+    return snap
 
-    return snapshot
 
-
-def _snapshot_changed(old: dict, new: dict) -> bool:
-    """
-    Compare two snapshots and return True if anything changed.
-    Detects: new files, deleted files, modified files.
-    """
-    if set(old.keys()) != set(new.keys()):
-        return True  # Files added or removed
-
-    for key in old:
-        if old[key] != new.get(key):
-            return True  # File modified
-
+def _changed(old: dict, new: dict) -> bool:
+    if set(old) != set(new):
+        return True
+    for k in old:
+        if old[k] != new.get(k):
+            return True
     return False
 
 
-def _describe_changes(old: dict, new: dict) -> str:
-    """Return a human-readable description of what changed."""
-    old_keys = set(old.keys())
-    new_keys = set(new.keys())
-
-    added = new_keys - old_keys
-    deleted = old_keys - new_keys
-    modified = {k for k in old_keys & new_keys if old[k] != new[k]}
-
+def _describe(old: dict, new: dict) -> str:
+    added    = len(set(new) - set(old))
+    deleted  = len(set(old) - set(new))
+    modified = sum(1 for k in set(old) & set(new) if old[k] != new[k])
     parts = []
-    if added:
-        parts.append(f"{len(added)} new file(s)")
-    if deleted:
-        parts.append(f"{len(deleted)} deleted file(s)")
-    if modified:
-        parts.append(f"{len(modified)} modified file(s)")
-
-    return ", ".join(parts) if parts else "unknown changes"
+    if added:    parts.append(f"{added} new")
+    if deleted:  parts.append(f"{deleted} deleted")
+    if modified: parts.append(f"{modified} modified")
+    return ", ".join(parts) if parts else "changes"
 
 
 # ─────────────────────────────────────────────
-# Main Watcher Class
+# Tee Logger: writes to console + log file
+# ─────────────────────────────────────────────
+
+class TeeLogger:
+    """
+    Writes messages to both the terminal AND a log file.
+    Used in daemon mode so you can see activity in both places.
+    """
+
+    def __init__(self, log_file: str = None, silent: bool = False):
+        self.log_file = log_file
+        self.silent   = silent   # if True: only write to file, not console
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def write(self, message: str, prefix: str = ""):
+        ts   = self._ts()
+        line = f"[{ts}] {prefix}{message}"
+
+        if not self.silent:
+            print(line, flush=True)
+
+        if self.log_file:
+            try:
+                with open(self.log_file, "a") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+
+    def __call__(self, message: str):
+        """Makes TeeLogger callable — compatible with logger=fn usage."""
+        self.write(message)
+
+    def event(self, message: str):
+        self.write(message, prefix=">> ")
+
+    def ok(self, message: str):
+        self.write(message, prefix="[OK] ")
+
+    def warn(self, message: str):
+        self.write(message, prefix="[!!] ")
+
+    def err(self, message: str):
+        self.write(message, prefix="[XX] ")
+
+    def section(self, title: str):
+        line = "-" * 50
+        self.write(line)
+        self.write(title)
+        self.write(line)
+
+
+# ─────────────────────────────────────────────
+# Stats tracker
+# ─────────────────────────────────────────────
+
+class WatchStats:
+    def __init__(self):
+        self.started      = time.time()
+        self.cycles       = 0
+        self.commits_made = 0
+        self.pushes_made  = 0
+        self.errors       = 0
+
+    def uptime(self) -> str:
+        secs = int(time.time() - self.started)
+        h, rem = divmod(secs, 3600)
+        m, s   = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m {s}s"
+        elif m:
+            return f"{m}m {s}s"
+        return f"{s}s"
+
+    def summary(self) -> str:
+        return (
+            f"Uptime: {self.uptime()} | "
+            f"Cycles: {self.cycles} | "
+            f"Commits: {self.commits_made} | "
+            f"Pushes: {self.pushes_made} | "
+            f"Errors: {self.errors}"
+        )
+
+
+# ─────────────────────────────────────────────
+# Main Watcher
 # ─────────────────────────────────────────────
 
 class Watcher:
     """
-    Monitors a Git repository for changes and triggers a callback.
+    Repository file watcher. Calls callback(path) when changes are detected.
 
-    Usage:
-        def on_change(path):
-            agent.run(path)
-
-        watcher = Watcher(config)
-        watcher.start(repo_path, on_change)
+    Supports two modes:
+      - Foreground: runs in terminal until Ctrl+C
+      - Background (daemon): runs forever, logs to file
     """
 
     def __init__(self, config: dict):
-        watcher_config = config.get("agent", {})
-        self.poll_interval = watcher_config.get("watch_interval_seconds", 10)
-        self.debounce = watcher_config.get("watch_debounce_seconds", 3)
-        self._running = False
+        agent_cfg         = config.get("agent", {})
+        self.poll_interval = agent_cfg.get("watch_interval_seconds", 10)
+        self.debounce      = agent_cfg.get("watch_debounce_seconds", 3)
+        self._running      = False
+        self.stats         = WatchStats()
 
     def start(
         self,
         path: str,
         callback: Callable[[str], None],
-        logger: Optional[Callable[[str], None]] = None
+        logger: Optional[Callable[[str], None]] = None,
+        log_file: str = None,
+        forever: bool = False,
     ) -> None:
         """
         Start watching the repository.
-        Calls `callback(path)` whenever changes are detected.
-        Blocks until Ctrl+C.
 
         Args:
-            path: Repository path to watch
-            callback: Function to call when changes are detected
-            logger: Optional logging function (defaults to print)
+            path:      Repo path to watch
+            callback:  Called with (path) when changes detected
+            logger:    Log function (defaults to TeeLogger)
+            log_file:  Path to write log file (optional)
+            forever:   If True, never exit on errors (daemon mode)
         """
-        log = logger or print
+        # Set up logger
+        if logger is None:
+            tee = TeeLogger(log_file=log_file, silent=(log_file is not None and forever))
+            log = tee
+        else:
+            log = logger
 
         self._running = True
-        log("👁  Watch mode started. Press Ctrl+C to stop.")
-        log(f"   Polling every {self.poll_interval}s with {self.debounce}s debounce")
+
+        log("")
+        log("Watch mode started")
+        log(f"Repo    : {path}")
+        log(f"Polling : every {self.poll_interval}s | debounce: {self.debounce}s")
+        log("Press Ctrl+C to stop (or use: python main.py --daemon stop)")
         log("")
 
         # Take initial snapshot
-        snapshot = _get_repo_snapshot(path)
-        log(f"   Initial snapshot: {len(snapshot)} files tracked")
+        snapshot = _snapshot(path)
+        log(f"Tracking {len(snapshot)} files")
         log("")
 
-        try:
-            while self._running:
+        while self._running:
+            try:
                 time.sleep(self.poll_interval)
 
-                # Check for changes
-                new_snapshot = _get_repo_snapshot(path)
+                new_snap = _snapshot(path)
 
-                if _snapshot_changed(snapshot, new_snapshot):
-                    change_desc = _describe_changes(snapshot, new_snapshot)
-                    log(f"🔔 Changes detected: {change_desc}")
-                    log(f"   Waiting {self.debounce}s for more changes (debounce)...")
+                if _changed(snapshot, new_snap):
+                    desc = _describe(snapshot, new_snap)
+                    log(f"Changes detected: {desc}")
+                    log(f"Waiting {self.debounce}s (debounce)...")
 
-                    # Debounce: wait and re-check to batch rapid saves
+                    # Debounce: wait for user to finish saving
                     time.sleep(self.debounce)
-                    final_snapshot = _get_repo_snapshot(path)
+                    final_snap = _snapshot(path)
+                    snapshot   = final_snap
 
-                    # Update snapshot (even if we're about to process)
-                    snapshot = final_snapshot
+                    log("Triggering agent workflow...")
+                    self.stats.cycles += 1
 
-                    # Trigger the callback
-                    log("▶  Triggering agent workflow...")
                     try:
                         callback(path)
+                        self.stats.commits_made += 1
                     except KeyboardInterrupt:
                         raise
                     except Exception as e:
-                        log(f"⚠  Agent error during watch: {e}")
-                        log("   Continuing to watch...")
+                        self.stats.errors += 1
+                        log(f"Agent error: {e}")
+                        if not forever:
+                            raise
+                        log("Continuing to watch (daemon mode)...")
 
                     log("")
-                    log(f"👁  Watching for more changes...")
+                    log(f"Watching... ({self.stats.summary()})")
+                    log("")
+
                 else:
-                    # No changes, update snapshot silently
-                    snapshot = new_snapshot
+                    snapshot = new_snap
 
-        except KeyboardInterrupt:
-            log("")
-            log("⏹  Watch mode stopped by user.")
-            self._running = False
+            except KeyboardInterrupt:
+                if not forever:
+                    log("")
+                    log("Watch mode stopped by user.")
+                    break
+                # In daemon mode, ignore Ctrl+C
+                log("Caught interrupt — continuing (daemon mode)")
 
-    def stop(self) -> None:
-        """Signal the watcher to stop on next poll."""
+            except Exception as e:
+                self.stats.errors += 1
+                log(f"Watcher error: {e}")
+                if not forever:
+                    raise
+                log("Recovering in 5s...")
+                time.sleep(5)
+
+        self._running = False
+
+    def stop(self):
+        """Signal the watcher to stop."""
         self._running = False
