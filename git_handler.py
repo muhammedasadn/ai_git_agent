@@ -248,6 +248,30 @@ def get_file_diff(path: str, filepath: str) -> str:
     return out
 
 
+def get_untracked_content(path: str, files: list[str], max_chars: int = 3000) -> str:
+    """
+    For new/untracked files, read a snippet of their content
+    so the AI can understand what they contain (since git diff
+    shows nothing for untracked files).
+    """
+    snippets = []
+    total = 0
+    for f in files[:10]:  # Cap at 10 files
+        full_path = os.path.join(path, f)
+        if not os.path.isfile(full_path):
+            continue
+        try:
+            with open(full_path, "r", errors="replace") as fh:
+                content = fh.read(500)  # First 500 chars per file
+            snippets.append(f"=== {f} ===\n{content}")
+            total += len(content)
+            if total > max_chars:
+                break
+        except Exception:
+            snippets.append(f"=== {f} === [binary or unreadable]")
+    return "\n\n".join(snippets)
+
+
 # ─────────────────────────────────────────────
 # Staging Operations
 # ─────────────────────────────────────────────
@@ -345,12 +369,18 @@ def get_full_repo_state(path: str) -> dict:
     Collect all relevant repo state in one call.
     Used by the agent to build context for AI analysis.
     """
+    status = get_status(path)
+    added = status.get("added", [])
+
     return {
         "branch": get_current_branch(path),
         "remotes": get_remotes(path),
-        "status": get_status(path),
+        "status": status,
         "diff": get_diff(path),
         "staged_diff": get_staged_diff(path),
         "diff_stat": get_diff_stat(path),
         "recent_commits": get_commit_log(path, n=3),
+        "has_commits": has_any_commits(path),
+        # For new files, include their actual content so AI can analyze them
+        "untracked_content": get_untracked_content(path, added) if added else "",
     }
