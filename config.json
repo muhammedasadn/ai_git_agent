@@ -7,6 +7,9 @@
   },
   "agent": {
     "auto_push": false,
+    "auto_init": true,
+    "interactive": false,
+    "dry_run": false,
     "max_commits_per_run": 10,
     "watch_interval_seconds": 10,
     "watch_debounce_seconds": 3
@@ -23,6 +26,7 @@
   },
   "logging": {
     "verbose": false,
+    "unicode_symbols": false,
     "log_to_file": false,
     "log_file": "agent.log"
   }
