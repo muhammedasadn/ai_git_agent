@@ -8,6 +8,7 @@ no AI logic here, just reliable Git execution and output parsing.
 
 import subprocess
 import os
+import socket
 from typing import Optional
 
 
@@ -40,7 +41,7 @@ def _run(cmd: list[str], cwd: str, capture: bool = True) -> tuple[int, str, str]
 
 
 # ─────────────────────────────────────────────
-# Repository Validation
+# Repository Validation & Initialization
 # ─────────────────────────────────────────────
 
 def is_git_repo(path: str) -> bool:
@@ -53,6 +54,58 @@ def get_repo_root(path: str) -> Optional[str]:
     """Return the absolute root path of the Git repository."""
     code, out, _ = _run(["git", "rev-parse", "--show-toplevel"], path)
     return out if code == 0 else None
+
+
+def init_repo(path: str) -> tuple[bool, str]:
+    """
+    Initialize a new Git repository at the given path.
+    Also configures a default user name/email if not set globally.
+    Returns (success, message).
+    """
+    code, out, err = _run(["git", "init"], path)
+    if code != 0:
+        return False, err or out
+
+    # Auto-configure user identity if not set (needed for first commit)
+    _ensure_git_identity(path)
+
+    return True, out
+
+
+def _ensure_git_identity(path: str):
+    """
+    If git user.name / user.email are not configured globally,
+    set sensible local defaults so commits don't fail.
+    """
+    # Check if global identity exists
+    code_name, name, _ = _run(["git", "config", "--global", "user.name"], path)
+    code_email, email, _ = _run(["git", "config", "--global", "user.email"], path)
+
+    if code_name != 0 or not name.strip():
+        # Use system hostname as a fallback name
+        hostname = socket.gethostname().split(".")[0]
+        _run(["git", "config", "--local", "user.name", f"AI Agent ({hostname})"], path)
+
+    if code_email != 0 or not email.strip():
+        _run(["git", "config", "--local", "user.email", "ai-agent@localhost"], path)
+
+
+def has_any_commits(path: str) -> bool:
+    """Return True if the repo has at least one commit."""
+    code, _, _ = _run(["git", "rev-parse", "HEAD"], path)
+    return code == 0
+
+
+def get_gitignore_patterns(path: str) -> list[str]:
+    """Return patterns from .gitignore if it exists."""
+    gitignore = os.path.join(path, ".gitignore")
+    if not os.path.exists(gitignore):
+        return []
+    try:
+        with open(gitignore) as f:
+            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except Exception:
+        return []
 
 
 # ─────────────────────────────────────────────
