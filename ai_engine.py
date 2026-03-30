@@ -362,18 +362,22 @@ Explain what went wrong and how to fix it.
     def should_commit(self, repo_state: dict) -> tuple[bool, str]:
         """
         Ask the AI whether the current changes are meaningful enough to commit.
+        NOTE: This is ONLY called for all-junk-file scenarios.
+        Real source files always get committed — see agent.py.
         Returns (should_commit, reason).
         """
         system = (
             "You are a code reviewer. Decide if the given changes are worth committing. "
-            "A commit is NOT worth making for: whitespace-only changes, empty files, "
-            "auto-generated files with no logic, or trivial single-character edits. "
+            "Be LIBERAL — err on the side of committing. "
+            "Only return false for: purely empty files with zero content, "
+            "or files that are 100% identical to what was there before. "
+            "New project files, config files, README files ARE worth committing. "
             "Return JSON only: {\"commit\": true/false, \"reason\": \"explanation\"}"
         )
 
         status = repo_state.get("status", {})
         diff_stat = repo_state.get("diff_stat", "")
-        diff = repo_state.get("diff", "")[:1500]
+        untracked = repo_state.get("untracked_content", "")[:1000]
 
         all_files = (
             status.get("modified", []) +
@@ -387,9 +391,10 @@ Explain what went wrong and how to fix it.
         user_msg = f"""
 Files: {all_files}
 Stats: {diff_stat}
-Diff (truncated): {diff}
+New file content preview:
+{untracked}
 
-Should these changes be committed?
+Should these changes be committed? Remember: be liberal, err on the side of committing.
 """.strip()
 
         raw = self._chat(system, user_msg)
@@ -403,5 +408,78 @@ Should these changes be committed?
         except (json.JSONDecodeError, KeyError):
             pass
 
-        # Default: yes, commit
+        # Default: YES, commit
         return True, "Proceeding with commit (AI decision unavailable)."
+
+    # ─────────────────────────────────────────
+    # Task 6: Generate Initial Commit Message
+    # ─────────────────────────────────────────
+
+    def generate_initial_commit_message(self, repo_state: dict) -> str:
+        """
+        Generate a message specifically for the very first commit of a project.
+        Analyzes the project structure to write something meaningful.
+        """
+        system = (
+            "You are writing the first commit message for a new project. "
+            "Look at the files and write a meaningful initial commit message. "
+            "Use conventional commit format. Common choices: "
+            "'chore: initial project setup', 'feat: initialize React app', "
+            "'chore: bootstrap Node.js API project'. "
+            "Be specific about the tech stack if visible. "
+            "Return ONLY the commit message. No quotes, no explanation."
+        )
+
+        status = repo_state.get("status", {})
+        added  = status.get("added", [])
+        untracked = repo_state.get("untracked_content", "")[:2000]
+
+        user_msg = f"""
+New files in this project: {added[:20]}
+
+File content preview:
+{untracked}
+
+Write the initial commit message.
+""".strip()
+
+        result = self._chat(system, user_msg).strip().strip('"\'`').split("\n")[0].strip()
+        return result if result else "chore: initial project setup"
+
+    # ─────────────────────────────────────────
+    # Task 7: Suggest Branch Name
+    # ─────────────────────────────────────────
+
+    def suggest_branch_name(self, repo_state: dict) -> str:
+        """
+        Suggest a git branch name based on current uncommitted changes.
+        Returns a slug like 'feature/add-user-auth' or 'fix/login-crash'.
+        """
+        system = (
+            "You are suggesting a Git branch name based on uncommitted changes. "
+            "Use kebab-case with a prefix: feature/, fix/, refactor/, docs/, chore/. "
+            "Examples: 'feature/add-login-page', 'fix/null-pointer-crash', "
+            "'refactor/clean-up-api-routes'. "
+            "Max 50 characters. Return ONLY the branch name. Nothing else."
+        )
+
+        status = repo_state.get("status", {})
+        diff   = repo_state.get("diff", "")[:1500]
+        all_files = (
+            status.get("modified", []) +
+            status.get("added", []) +
+            status.get("deleted", [])
+        )
+
+        user_msg = f"""
+Files changed: {all_files[:10]}
+Diff preview: {diff[:500]}
+
+Suggest a branch name.
+""".strip()
+
+        result = self._chat(system, user_msg).strip().strip('"\'`').split("\n")[0].strip()
+        # Sanitize
+        import re
+        result = re.sub(r"[^a-z0-9\-/]", "-", result.lower())
+        return result if result else "feature/ai-changes"
