@@ -211,6 +211,10 @@ TIPS:
                         help="Show rich status dashboard")
     parser.add_argument("--status",      "-s",  action="store_true",
                         help="Show git status only (no AI)")
+    parser.add_argument("--monitor",     "-m",  action="store_true",
+                        help="Open real-time log monitor TUI")
+    parser.add_argument("--compact",            action="store_true",
+                        help="Use compact layout in monitor")
 
     # ── Config ──
     parser.add_argument("--no-validate",        action="store_true",
@@ -293,6 +297,13 @@ def main():
                 dc.stop(path)
                 import time; time.sleep(1)
                 dc.start(path, config)
+
+        # ── Monitor TUI ──
+        elif args.monitor:
+            from monitor import Monitor
+            m = Monitor(os.path.abspath(args.path),
+                        compact=getattr(args, "compact", False))
+            m.run()
 
         # ── Setup remote ──
         elif args.setup_remote:
