@@ -20,7 +20,7 @@ import git_handler
 from ai_engine import AIEngine
 from validator import Validator, detect_project_type
 from watcher import Watcher, TeeLogger
-from remote_setup import RemoteSetup, load_state, save_state, get_saved_remote
+import RemoteSetup 
 
 
 # ─────────────────────────────────────────────
@@ -202,7 +202,7 @@ class Agent:
             return True  # Already has a remote
 
         # Check saved state for URL
-        saved_url = get_saved_remote(path)
+        saved_url = RemoteSetup.get_saved_remote(path)
         if saved_url:
             # Apply saved URL if not already in git config
             code, _, err = git_handler._run(
@@ -216,7 +216,7 @@ class Agent:
         if self.interactive or not self.auto_push:
             self.log.warning("No remote configured.")
             if self.auto_push:
-                wizard = RemoteSetup()
+                wizard = RemoteSetup.RemoteSetup()
                 url = wizard.run(path)
                 if url:
                     self.auto_push = True
@@ -605,7 +605,7 @@ class Agent:
                 self.log.error("Not a Git repository.")
                 return
 
-        wizard = RemoteSetup()
+        wizard = RemoteSetup.RemoteSetup()
         url = wizard.run(path)
         if url:
             self.auto_push = True
