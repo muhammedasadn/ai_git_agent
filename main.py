@@ -259,7 +259,6 @@ def main():
     # ── Internal daemon flag: watch forever, log to file ──
     if args.watch_forever:
         from agent import Agent
-        import os
         path     = os.path.abspath(args.path)
         log_file = os.path.join(path, ".agent_log.txt")
         config["agent"]["auto_push"]   = True
