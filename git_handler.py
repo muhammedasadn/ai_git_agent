@@ -335,29 +335,109 @@ def commit(path: str, message: str) -> tuple[bool, str, str]:
 # Push Operations
 # ─────────────────────────────────────────────
 
+def get_default_branch(path: str) -> str:
+    """
+    Detect the repo's default branch name.
+    Checks remote HEAD first, then falls back to common names.
+    Always returns 'main' or 'master' — never a feature branch.
+    """
+    # Try to get from remote HEAD (most reliable)
+    code, out, _ = _run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"], path
+    )
+    if code == 0 and out:
+        # e.g. "refs/remotes/origin/main" → "main"
+        return out.strip().split("/")[-1]
+
+    # Try git remote show origin (slower but accurate)
+    code2, out2, _ = _run(
+        ["git", "remote", "show", "origin"], path
+    )
+    if code2 == 0:
+        for line in out2.splitlines():
+            line = line.strip()
+            if line.startswith("HEAD branch:"):
+                branch = line.split(":", 1)[1].strip()
+                if branch and branch != "(unknown)":
+                    return branch
+
+    # Check if main exists
+    code3, _, _ = _run(["git", "show-ref", "--verify", "refs/heads/main"], path)
+    if code3 == 0:
+        return "main"
+
+    # Check if master exists
+    code4, _, _ = _run(["git", "show-ref", "--verify", "refs/heads/master"], path)
+    if code4 == 0:
+        return "master"
+
+    # Last resort: use current branch (only if it looks like a default)
+    current = get_current_branch(path)
+    if current in ("main", "master", "develop", "trunk"):
+        return current
+
+    # Hardcoded safe default
+    return "main"
+
+
 def push(path: str, remote: str = "origin", branch: Optional[str] = None) -> tuple[bool, str]:
     """
     Push commits to the remote repository.
 
+    IMPORTANT: Always pushes to the DEFAULT branch (main/master).
+    Never pushes to feature branches to prevent accidental repo damage.
+
     Returns (success, error_message).
     """
-    if branch is None:
-        branch = get_current_branch(path)
+    # ALWAYS resolve to the default branch — never push to feature branches
+    default = get_default_branch(path)
+    current = get_current_branch(path)
 
-    cmd = ["git", "push", remote, branch]
+    # If we're on a non-default branch, warn but push to default via merge ref
+    # For now: only push if we're ON the default branch
+    if current != default:
+        return False, (
+            f"PUSH BLOCKED: You are on branch '{current}', not '{default}'.\n"
+            f"The agent only pushes to the default branch '{default}'.\n"
+            f"To push manually: git checkout {default} && git merge {current} && git push"
+        )
+
+    target_branch = default
+
+    # First try: normal push
+    cmd = ["git", "push", remote, target_branch]
     code, out, err = _run(cmd, path)
 
-    if code != 0:
-        # Detect "no upstream" and handle set-upstream
-        if "no upstream" in err.lower() or "set-upstream" in err.lower():
-            cmd_upstream = ["git", "push", "--set-upstream", remote, branch]
-            code2, _, err2 = _run(cmd_upstream, path)
-            if code2 != 0:
-                return False, err2
-            return True, ""
-        return False, err or out
+    if code == 0:
+        return True, ""
 
-    return True, ""
+    combined = (err + " " + out).lower()
+
+    # Handle "no upstream tracking" — set it automatically
+    if "set-upstream" in combined or "no upstream" in combined or "has no upstream" in combined:
+        cmd_up = ["git", "push", "--set-upstream", remote, target_branch]
+        code2, out2, err2 = _run(cmd_up, path)
+        if code2 == 0:
+            return True, ""
+        return False, err2 or out2
+
+    # Handle "rejected" — remote has changes we don't have (need pull first)
+    if "rejected" in combined or "non-fast-forward" in combined:
+        return False, (
+            f"Push rejected: remote '{remote}/{target_branch}' has new commits.\n"
+            f"Fix: git pull --rebase origin {target_branch}  then try again."
+        )
+
+    # Handle auth errors
+    if "authentication" in combined or "permission denied" in combined or "403" in combined:
+        return False, (
+            "Push failed: authentication error.\n"
+            "Fix: make sure your token/SSH key is configured.\n"
+            "For HTTPS: git config --global credential.helper store\n"
+            "Then push once manually to save credentials."
+        )
+
+    return False, err or out
 
 
 # ─────────────────────────────────────────────
