@@ -227,6 +227,11 @@ TIPS:
                         help="Verbose logging")
     parser.add_argument("--model",              default=None,
                         help="Override Ollama model (e.g. codellama, llama3.2)")
+    parser.add_argument("--gemini-key",         default=None, metavar="KEY",
+                        help="Set Gemini API key (get free key at aistudio.google.com)")
+    parser.add_argument("--batch-window",       default=None, type=int, metavar="SECS",
+                        help="Batch window in seconds before committing (default: 300 = 5min). "
+                             "Use 0 to commit immediately on every change.")
     parser.add_argument("--config",             default=None,
                         help="Path to custom config.json")
     parser.add_argument("--version",            action="version",
@@ -259,10 +264,15 @@ def main():
     if args.dry_run:        config["agent"]["dry_run"]        = True
     if args.interactive:    config["agent"]["interactive"]    = True
     if args.model:          config["ollama"]["model"]         = args.model
+    if args.gemini_key:
+        config.setdefault("gemini", {})["api_key"] = args.gemini_key
+    if args.batch_window is not None:
+        config["agent"]["batch_window_seconds"] = args.batch_window
 
     # ── Internal daemon flag: watch forever, log to file ──
     if args.watch_forever:
         from agent import Agent
+        import os
         path     = os.path.abspath(args.path)
         log_file = os.path.join(path, ".agent_log.txt")
         config["agent"]["auto_push"]   = True
