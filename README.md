@@ -4,6 +4,8 @@ Automate your Git workflow with AI-powered commit messages and intelligent repos
 
 ## Features
 
+- **Dual AI Backends**: Gemini API (free, Google AI) or Ollama (local) for commit message generation
+- **Intelligent Batch Processing**: Collect file changes over a 5-minute window before creating commits
 - **AI-Powered Commits**: Generates meaningful commit messages using AI analysis
 - **Background Daemon Mode**: Run the agent continuously in the background
 - **Interactive Remote Setup**: Wizard-based GitHub/GitLab remote configuration
@@ -62,16 +64,81 @@ python main.py --daemon stop /path/to/repo
 
 ## Configuration
 
+### AI Backend: Gemini API vs Ollama
+
+**Gemini API (Recommended - Free)**
+
+The agent now uses Google's Gemini API by default (free tier with no credit card required):
+
+1. Get your free API key: https://aistudio.google.com/app/apikey
+2. Set via CLI:
+```bash
+python main.py --gemini-key "AIza..." --watch /path/to/repo
+```
+
+Or in `config.json`:
+```json
+{
+  "gemini": {
+    "api_key": "AIza...",
+    "model": "gemini-1.5-flash",
+    "temperature": 0.2
+  }
+}
+```
+
+Or via environment variable:
+```bash
+export GEMINI_API_KEY="AIza..."
+```
+
+**Ollama (Local Alternative)**
+
+If Gemini is not configured, the agent automatically falls back to Ollama:
+```bash
+python main.py --model qwen2.5-coder:1.5b --watch /path/to/repo
+```
+
+### Batch Window Configuration
+
+By default, the agent collects file changes over a 5-minute window before creating a commit:
+
+```bash
+# Use default 5-minute batch window
+python main.py --watch /path/to/repo
+
+# Use 1-minute batch window
+python main.py --batch-window 60 --watch /path/to/repo
+
+# Disable batching (commit immediately)
+python main.py --batch-window 0 --watch /path/to/repo
+```
+
+Or in `config.json`:
+```json
+{
+  "agent": {
+    "batch_window_seconds": 300
+  }
+}
+```
+
+### Advanced Configuration
+
 Edit `config.json` to customize agent behavior:
 
 ```json
 {
   "agent": {
     "auto_push": false,
-    "interactive": true
+    "interactive": true,
+    "batch_window_seconds": 300,
+    "watch_interval_seconds": 5
   },
-  "ai": {
-    "model": "gpt-4"
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "model": "qwen2.5-coder:1.5b",
+    "temperature": 0.2
   },
   "logging": {
     "verbose": false
