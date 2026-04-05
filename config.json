@@ -1,9 +1,14 @@
 {
+  "gemini": {
+    "api_key": "",
+    "model": "gemini-1.5-flash",
+    "temperature": 0.2
+  },
   "ollama": {
     "base_url": "http://localhost:11434",
     "model": "qwen2.5-coder:1.5b",
     "timeout": 120,
-    "temperature": 0.3
+    "temperature": 0.2
   },
   "agent": {
     "auto_push": false,
@@ -11,7 +16,8 @@
     "interactive": false,
     "dry_run": false,
     "max_commits_per_run": 10,
-    "watch_interval_seconds": 10,
+    "watch_interval_seconds": 5,
+    "batch_window_seconds": 300,
     "watch_debounce_seconds": 3
   },
   "validation": {
